@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="theme-color" content="#24292e">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="Haus">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="icon" href="icon-192.png">
+  <title>Haus</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #1f1f1f; }
+    html, body { margin: 0; height: 100%; background: #24292e; }
+    body { display: flex; align-items: center; justify-content: center; padding: 16px; box-sizing: border-box; }
+    form { background: #f5f3ef; border-radius: 12px; padding: 28px 24px 22px; width: 100%; max-width: 340px; box-sizing: border-box; }
+    img { display: block; width: 64px; height: 64px; border-radius: 14px; margin: 0 auto 14px; }
+    h1 { font-size: 20px; margin: 0 0 18px; text-align: center; }
+    input { width: 100%; box-sizing: border-box; font-size: 16px; padding: 11px 12px; border: 1px solid #dedad3; border-radius: 8px; background: #fff; }
+    button { width: 100%; margin-top: 12px; font-size: 16px; font-weight: 600; padding: 11px; border: 0; border-radius: 8px; background: #2f5d7c; color: #fff; cursor: pointer; }
+    button:disabled { opacity: .6; }
+    p { font-size: 13px; color: #6b6b6b; margin: 12px 0 0; min-height: 1.3em; text-align: center; }
+    p.fehler { color: #c62828; }
+    .unsichtbar { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+    form[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <form id="login" hidden autocomplete="on">
+    <img src="icon-192.png" alt="">
+    <h1>Haus</h1>
+    <input class="unsichtbar" type="text" name="username" autocomplete="username" value="haus" tabindex="-1" aria-hidden="true">
+    <input id="pw" type="password" name="password" autocomplete="current-password" placeholder="Passwort" required autofocus>
+    <button id="los">Öffnen</button>
+    <p id="msg"></p>
+  </form>
+  <script>
+    // Anmeldung der Handy-Version: Passwort -> Schlüssel (PBKDF2), Probe am Inhaltsverzeichnis, Schlüssel in IndexedDB.
+    // Den Rest (Entschlüsseln, Offline-Speicher) macht sw.js.
+    const $ = (s) => document.querySelector(s);
+    const kannSW = 'serviceWorker' in navigator;
+    if (kannSW) navigator.serviceWorker.register('sw.js');
+
+    function db() {
+      return new Promise((ok, fehler) => {
+        const r = indexedDB.open('haus', 1);
+        r.onupgradeneeded = () => r.result.createObjectStore('k');
+        r.onsuccess = () => ok(r.result); r.onerror = () => fehler(r.error);
+      });
+    }
+    async function idb(modus, f) {
+      const d = await db();
+      return new Promise((ok, fehler) => { const t = d.transaction('k', modus), r = f(t.objectStore('k')); t.oncomplete = () => ok(r?.result); t.onerror = () => fehler(t.error); });
+    }
+    async function zurApp() { await navigator.serviceWorker.ready; location.replace('app/'); }
+    function meldung(text, fehler) { $('#msg').textContent = text; $('#msg').className = fehler ? 'fehler' : ''; }
+
+    (async () => {
+      if (!kannSW) { $('#login').hidden = false; meldung('Dieser Browser kann die App nicht laden (privates Fenster?).', true); $('#los').disabled = true; return; }
+      const key = await idb('readonly', (s) => s.get('schluessel')).catch(() => null);
+      if (key) { zurApp(); return; }
+      $('#login').hidden = false; $('#pw').focus();
+    })();
+
+    $('#login').onsubmit = async (e) => {
+      e.preventDefault();
+      $('#los').disabled = true; meldung('Prüfe …');
+      try {
+        const [meta, bin] = await Promise.all([
+          fetch('meta.json', { cache: 'no-cache' }).then((r) => r.json()),
+          fetch('inhalt.bin', { cache: 'no-cache' }).then((r) => r.arrayBuffer()),
+        ]);
+        const roh = await crypto.subtle.importKey('raw', new TextEncoder().encode($('#pw').value), 'PBKDF2', false, ['deriveBits']);
+        const salz = Uint8Array.from(atob(meta.salz), (c) => c.charCodeAt(0));
+        const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: salz, iterations: meta.iterationen }, roh, 512);
+        const key = await crypto.subtle.importKey('raw', bits.slice(0, 32), 'AES-GCM', false, ['decrypt']);
+        try { await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bin.slice(0, 12) }, key, bin.slice(12)); } catch {
+          meldung('Passwort stimmt nicht.', true); $('#los').disabled = false; $('#pw').select(); return;
+        }
+        await idb('readwrite', (s) => s.put(key, 'schluessel'));
+        meldung('Öffne …');
+        await zurApp();
+      } catch {
+        meldung('Keine Verbindung. Für die erste Anmeldung braucht es Internet.', true); $('#los').disabled = false;
+      }
+    };
+  </script>
+</body>
+</html>
