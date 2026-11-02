@@ -39,12 +39,13 @@
     <p id="msg"></p>
   </form>
   <script>
-    // Anmeldung der Handy-Version: Passwort -> Schlüssel (PBKDF2), Probe am Inhaltsverzeichnis, Schlüssel in IndexedDB.
+    // Anmeldung der Handy-Version: Passwort -> Schlüssel (PBKDF2), Probe am Inhaltsverzeichnis, Schlüssel ablegen.
     // Den Rest (Entschlüsseln, Offline-Speicher) macht sw.js.
     const $ = (s) => document.querySelector(s);
-    const kannSW = 'serviceWorker' in navigator;
-    if (kannSW) navigator.serviceWorker.register('sw.js');
-
+    const kannSW = 'serviceWorker' in navigator && 'caches' in window;
+    // Schlüssel als rohe Bytes in IndexedDB und im Cache Storage; beides liest auch der Service Worker (siehe sw.js)
+    const SCHLUESSEL = 'schluessel', SCHLUESSEL_URL = 'schluessel.bin';
+    const frist = (ms, p) => Promise.race([p, new Promise((_, f) => setTimeout(() => f(new Error('Zeit')), ms))]);
     function db() {
       return new Promise((ok, fehler) => {
         const r = indexedDB.open('haus', 1);
@@ -53,40 +54,80 @@
       });
     }
     async function idb(modus, f) {
-      const d = await db();
+      const d = await frist(3000, db());
       return new Promise((ok, fehler) => { const t = d.transaction('k', modus), r = f(t.objectStore('k')); t.oncomplete = () => ok(r?.result); t.onerror = () => fehler(t.error); });
     }
-    async function zurApp() { await navigator.serviceWorker.ready; location.replace('app/'); }
+    async function hatSchluessel() {
+      if (await idb('readonly', (s) => s.get('roh')).catch(() => null)) return true;
+      return frist(3000, caches.open(SCHLUESSEL).then((c) => c.match(SCHLUESSEL_URL))).then(Boolean).catch(() => false);
+    }
+    async function schluesselSpeichern(roh) {
+      const a = await idb('readwrite', (s) => { s.put(roh, 'roh'); s.delete('schluessel'); }).then(() => true, () => false);
+      const b = await caches.open(SCHLUESSEL).then((c) => c.put(SCHLUESSEL_URL, new Response(roh))).then(() => true, () => false);
+      if (!a && !b) throw new Error('Speichern');
+    }
+
     function meldung(text, fehler) { $('#msg').textContent = text; $('#msg').className = fehler ? 'fehler' : ''; }
+    function formular(text, fehler) { $('#login').hidden = false; $('#los').disabled = false; meldung(text || '', fehler); $('#pw').focus(); }
+
+    async function zurApp() {
+      try { await frist(15000, navigator.serviceWorker.ready); } catch {
+        formular('Der Offline-Speicher startet nicht. Seite neu laden; hilft das nicht, die Adresse mit ?reset am Ende öffnen.', true); return;
+      }
+      sessionStorage.setItem('weiter', Date.now());
+      location.replace('app/');
+    }
+
+    // ?reset: alles Gespeicherte dieser Seite löschen (Offline-Speicher, Schlüssel) und neu anfangen
+    async function zuruecksetzen() {
+      $('#login').hidden = false; meldung('Setze zurück …');
+      for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+      for (const k of await caches.keys()) await caches.delete(k);
+      await new Promise((ok) => { const r = indexedDB.deleteDatabase('haus'); r.onsuccess = r.onerror = r.onblocked = ok; setTimeout(ok, 2000); });
+      sessionStorage.clear();
+      location.replace('./');
+    }
 
     (async () => {
-      if (!kannSW) { $('#login').hidden = false; meldung('Dieser Browser kann die App nicht laden (privates Fenster?).', true); $('#los').disabled = true; return; }
-      const key = await idb('readonly', (s) => s.get('schluessel')).catch(() => null);
-      if (key) { zurApp(); return; }
-      $('#login').hidden = false; $('#pw').focus();
+      const q = new URLSearchParams(location.search);
+      if (!kannSW) { formular('Dieser Browser kann die App nicht laden (privates Fenster?).', true); $('#los').disabled = true; return; }
+      if (q.has('reset')) { await zuruecksetzen(); return; }
+      navigator.serviceWorker.register('sw.js');
+      idb('readwrite', (s) => s.delete('schluessel')).catch(() => null);   // CryptoKey der ersten Version
+      if (location.search) history.replaceState(null, '', './');
+      // Schleifensperre: kommt die Seite binnen 8 s nach einer Weiterleitung zur App wieder hierher zurück, wird nicht
+      // noch einmal weitergeleitet. ?anmelden schickt der Offline-Speicher, wenn ihm der Schlüssel fehlt (Fehler A);
+      // ?fehlt schickt 404.html, wenn die App am Offline-Speicher vorbei geladen wurde (Fehler B).
+      const zurueck = Date.now() - (+sessionStorage.getItem('weiter') || 0) < 8000;
+      sessionStorage.removeItem('weiter');
+      if (zurueck && q.has('anmelden') && await hatSchluessel()) { formular('Fehler A: Der Offline-Speicher findet den Schlüssel nicht. Bitte an Claude schicken.', true); return; }
+      if (zurueck && q.has('fehlt')) { formular('Fehler B: Safari lädt die App am Offline-Speicher vorbei. Bitte an Claude schicken.', true); return; }
+      if (zurueck) { formular('Bitte noch einmal anmelden.'); return; }
+      if (!q.has('anmelden') && await hatSchluessel()) { zurApp(); return; }
+      formular();
     })();
 
     $('#login').onsubmit = async (e) => {
       e.preventDefault();
       $('#los').disabled = true; meldung('Prüfe …');
+      let meta, bin;
       try {
-        const [meta, bin] = await Promise.all([
+        [meta, bin] = await Promise.all([
           fetch('meta.json', { cache: 'no-cache' }).then((r) => r.json()),
           fetch('inhalt.bin', { cache: 'no-cache' }).then((r) => r.arrayBuffer()),
         ]);
-        const roh = await crypto.subtle.importKey('raw', new TextEncoder().encode($('#pw').value), 'PBKDF2', false, ['deriveBits']);
-        const salz = Uint8Array.from(atob(meta.salz), (c) => c.charCodeAt(0));
-        const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: salz, iterations: meta.iterationen }, roh, 512);
-        const key = await crypto.subtle.importKey('raw', bits.slice(0, 32), 'AES-GCM', false, ['decrypt']);
-        try { await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bin.slice(0, 12) }, key, bin.slice(12)); } catch {
-          meldung('Passwort stimmt nicht.', true); $('#los').disabled = false; $('#pw').select(); return;
-        }
-        await idb('readwrite', (s) => s.put(key, 'schluessel'));
-        meldung('Öffne …');
-        await zurApp();
-      } catch {
-        meldung('Keine Verbindung. Für die erste Anmeldung braucht es Internet.', true); $('#los').disabled = false;
+      } catch { formular('Keine Verbindung. Für die erste Anmeldung braucht es Internet.', true); return; }
+      const pw = await crypto.subtle.importKey('raw', new TextEncoder().encode($('#pw').value), 'PBKDF2', false, ['deriveBits']);
+      const salz = Uint8Array.from(atob(meta.salz), (c) => c.charCodeAt(0));
+      const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: salz, iterations: meta.iterationen }, pw, 512);
+      const roh = new Uint8Array(bits.slice(0, 32));
+      const key = await crypto.subtle.importKey('raw', roh, 'AES-GCM', false, ['decrypt']);
+      try { await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bin.slice(0, 12) }, key, bin.slice(12)); } catch {
+        formular('Passwort stimmt nicht.', true); $('#pw').select(); return;
       }
+      try { await schluesselSpeichern(roh); } catch { formular('Der Browser lässt nichts speichern (privates Fenster oder voller Speicher?).', true); return; }
+      meldung('Öffne …');
+      await zurApp();
     };
   </script>
 </body>

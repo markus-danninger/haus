@@ -1,19 +1,21 @@
 // Service Worker der Handy-Version (gebaut von tools/handy.mjs). Die App liegt verschlüsselt unter d/<id>; der Worker
-// entschlüsselt sie beim Laden mit dem Schlüssel aus IndexedDB (nach der Passworteingabe) und liefert sie unter app/ aus.
+// entschlüsselt sie beim Laden mit dem Schlüssel (nach der Passworteingabe gespeichert) und liefert sie unter app/ aus.
 // Alles Geladene bleibt im Cache, damit die App auch ohne Netz geht. Platzhalter füllt der Build.
-const SHELL = 'shell-e62b060a45ed', DATEN = 'daten', CDN = 'cdn';
+const SHELL = 'shell-b65ff6a6e30a', DATEN = 'daten', CDN = 'cdn', SCHLUESSEL = 'schluessel';
 const CDN_DATEIEN = ["https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/math/SimplexNoise.js","https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/objects/Sky.js","https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/postprocessing/EffectComposer.js","https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/postprocessing/GTAOPass.js","https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/postprocessing/MaskPass.js","https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/postprocessing/OutputPass.js","https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/postprocessing/Pass.js","https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/postprocessing/RenderPass.js","https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/postprocessing/ShaderPass.js","https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/shaders/CopyShader.js","https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/shaders/GTAOShader.js","https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/shaders/OutputShader.js","https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/shaders/PoissonDenoiseShader.js","https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/utils/BufferGeometryUtils.js"];
 const BASIS = new URL('./', self.location).href, BASIS_PFAD = new URL(BASIS).pathname;
 const SHELL_DATEIEN = ['./', 'status.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png', 'meta.json'];
 
 self.addEventListener('install', (e) => e.waitUntil((async () => {
   const c = await caches.open(SHELL);
-  await c.addAll(SHELL_DATEIEN.map((p) => new Request(p, { cache: 'reload' })));
+  // einzeln: eine Datei, die gerade fehlt, darf den Worker nicht blockieren (sonst wartet die Anmeldung ewig)
+  await Promise.allSettled(SHELL_DATEIEN.map(async (p) => { const r = await fetch(p, { cache: 'reload' }); if (r.ok) await c.put(p, r); }));
   await self.skipWaiting();
 })()));
 
 self.addEventListener('activate', (e) => e.waitUntil((async () => {
-  for (const k of await caches.keys()) if (![SHELL, DATEN, CDN].includes(k)) await caches.delete(k);
+  for (const k of await caches.keys()) if (![SHELL, DATEN, CDN, SCHLUESSEL].includes(k)) await caches.delete(k);
+  await idb('readwrite', (s) => s.delete('schluessel')).catch(() => null);   // CryptoKey der ersten Version
   await self.clients.claim();
 })()));
 
@@ -23,7 +25,8 @@ self.addEventListener('fetch', (e) => {
   if (CDN_DATEIEN.includes(url.href)) { e.respondWith(cdn(url.href)); return; }
   if (!url.href.startsWith(BASIS)) return;
   const pfad = url.pathname.slice(BASIS_PFAD.length);
-  if (pfad === 'app') e.respondWith(Response.redirect(BASIS + 'app/', 302));
+  if (pfad === 'schluessel.bin') e.respondWith(new Response('', { status: 404 }));
+  else if (pfad === 'app') e.respondWith(Response.redirect(BASIS + 'app/', 302));
   else if (pfad.startsWith('app/')) e.respondWith(app(decodeURIComponent(pfad.slice(4)) || 'index.html', req));
   else if (pfad === 'inhalt.bin') e.respondWith(fetch(req.url, { cache: 'no-cache' }).catch(() => caches.match(BASIS + 'inhalt.bin')));
   else if (!pfad.startsWith('d/')) e.respondWith(caches.match(req, { ignoreSearch: true }).then((r) => r || fetch(req)));
@@ -34,6 +37,10 @@ self.addEventListener('message', (e) => {
 });
 
 // ---------- Schlüssel und Inhaltsverzeichnis ----------
+// Der Schlüssel liegt als rohe Bytes zweimal: in IndexedDB (teilen Seite und Worker in Safari zuverlässig) und im Cache
+// Storage. Die erste Version legte ein CryptoKey-Objekt in IndexedDB; das gab Safari am iPhone im Worker nicht heraus,
+// und Anmeldeseite und Worker schickten sich endlos hin und her.
+const SCHLUESSEL_URL = BASIS + 'schluessel.bin';
 function db() {
   return new Promise((ok, fehler) => {
     const r = indexedDB.open('haus', 1);
@@ -45,8 +52,14 @@ async function idb(modus, f) {
   const d = await db();
   return new Promise((ok, fehler) => { const t = d.transaction('k', modus), r = f(t.objectStore('k')); t.oncomplete = () => ok(r?.result); t.onerror = () => fehler(t.error); });
 }
-const schluessel = () => idb('readonly', (s) => s.get('schluessel')).catch(() => null);
-const schluesselWeg = () => idb('readwrite', (s) => s.delete('schluessel')).catch(() => null);
+async function schluessel() {
+  let roh = await idb('readonly', (s) => s.get('roh')).catch(() => null);
+  if (!roh) roh = await caches.open(SCHLUESSEL).then((c) => c.match(SCHLUESSEL_URL)).then((r) => r?.arrayBuffer()).catch(() => null);
+  try { return roh ? await crypto.subtle.importKey('raw', roh, 'AES-GCM', false, ['decrypt']) : null; } catch { return null; }
+}
+const schluesselWeg = () => Promise.all([
+  idb('readwrite', (s) => { s.delete('roh'); s.delete('schluessel'); }).catch(() => null), caches.delete(SCHLUESSEL).catch(() => null),
+]);
 
 async function entschluesseln(key, buf) {
   return crypto.subtle.decrypt({ name: 'AES-GCM', iv: buf.slice(0, 12) }, key, buf.slice(12));
@@ -91,7 +104,8 @@ async function blob(id) {
 // ---------- App ausliefern ----------
 async function app(rel, req) {
   const navi = req.mode === 'navigate';
-  const zurLogin = () => (navi ? Response.redirect(BASIS, 302) : new Response('', { status: 401 }));
+  // ?anmelden: die Anmeldeseite zeigt dann das Formular, statt gleich wieder hierher weiterzuleiten
+  const zurLogin = () => (navi ? Response.redirect(BASIS + '?anmelden', 302) : new Response('', { status: 401 }));
   const key = await schluessel();
   if (!key) return zurLogin();
   let idx;

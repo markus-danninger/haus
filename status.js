@@ -1,5 +1,7 @@
 // Anzeige in der Handy-Version (oben rechts in der Ansicht): füllt den Offline-Speicher und zeigt Fortschritt und Stand.
 (() => {
+  // App ist angekommen: die Schleifensperre der Anmeldeseite (index.html) zurücksetzen
+  try { sessionStorage.removeItem('weiter'); } catch { /* egal */ }
   const sw = navigator.serviceWorker;
   if (!sw?.controller) return;
   navigator.storage?.persist?.();
